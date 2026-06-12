@@ -1,0 +1,8 @@
+scenario,variant,completed,rounds,peak_input_tokens,final_input_tokens,compactions,note
+S1_context,compact_on,False,24,2330,1584,3,
+S1_context,compact_off,True,15,3306,3306,0,
+S2_retry,retry_on,True,5,1619,1619,0,retries=6
+S2_retry,retry_off,False,0,0,0,0,FakeAPIError: injected API error 502
+S4_tool_fail,self_correct,True,12,2943,2943,0,tool_fails=6（>0 且 completed 即为成功自纠）
+S5_interrupt,steer_on,True,6,0,0,0,注入改需求后产物含Goodbye=True
+S5_interrupt,steer_off(baseline),True,6,0,0,0,无注入产物含Hello=True
