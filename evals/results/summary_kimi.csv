@@ -1,0 +1,10 @@
+scenario,variant,completed,rounds,peak_input_tokens,final_input_tokens,compactions,note
+S1_context,compact_on,True,19,2259,1263,1,
+S1_context,compact_off,True,20,2726,2726,0,
+S2_retry,retry_on,True,7,943,943,0,retries=6
+S2_retry,retry_off,False,0,0,0,0,FakeAPIError: injected API error 502
+S3_resume,resume_on,True,12,0,0,0,crash_exit=137;从断点续到第12轮完成;崩溃前已落盘9事件
+S3_resume,no_resume(baseline),True,11,0,0,0,从头跑完需11轮（崩溃后不resume就要重付这些）
+S4_tool_fail,self_correct,True,8,1025,1025,0,tool_fails=1（>0 且 completed 即为成功自纠）
+S5_interrupt,steer_on,True,6,0,0,0,注入改需求后产物含Goodbye=True
+S5_interrupt,steer_off(baseline),True,5,0,0,0,无注入产物含Hello=True

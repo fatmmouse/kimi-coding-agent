@@ -51,6 +51,19 @@ class Agent:
         self.guard = recovery.LoopGuard()
         self.steering = interrupt_mod.StdinSteering(enabled=not args.no_interrupt)
         self._sigint = 0
+        # ---- 评测钩子（CLI 不暴露，评测脚本经 SimpleNamespace 注入）----
+        self.max_rounds = getattr(args, "max_rounds", MAX_ROUNDS)
+        self.context_window = getattr(args, "context_window", None) or self.provider.context_window
+        self._crash_after = getattr(args, "crash_after", None)   # 第 K 轮后 os._exit 模拟崩溃
+        self._steer_at = getattr(args, "steer_at", {}) or {}      # {round_no: "插话内容"}
+        chaos = getattr(args, "chaos", None)                      # 故障注入配置 dict
+        if chaos:
+            from evals.chaos import ChaosProvider
+            self.provider = ChaosProvider(self.provider, **chaos)
+        self.metrics = {
+            "completed": False, "rounds": 0, "input_tokens": [],
+            "compactions": 0, "retries": 0, "tool_fails": 0, "crashed": False,
+        }
 
     # ---------- 会话装载：新建或 resume ----------
     def load(self):
@@ -96,10 +109,18 @@ class Agent:
     def _drain_steering(self):
         """安全点注入 steering 消息（中断即上下文）。"""
         for line in self.steering.drain():
-            msg = {"role": "user", "content": f"[用户运行中插话] {line}"}
-            self.messages.append(msg)
-            self.log.append("message", {"message": msg})
-            print(f"[steering] 已注入: {line}")
+            self._inject_steer(line)
+
+    def _scripted_steer(self, round_no: int):
+        """评测用：在预设轮注入一条 steering 消息，模拟用户运行中插话。"""
+        if round_no in self._steer_at:
+            self._inject_steer(self._steer_at[round_no])
+
+    def _inject_steer(self, line: str):
+        msg = {"role": "user", "content": f"[用户运行中插话] {line}"}
+        self.messages.append(msg)
+        self.log.append("message", {"message": msg})
+        print(f"[steering] 已注入: {line}")
 
     # ---------- 主循环 ----------
     def run(self):
@@ -108,22 +129,27 @@ class Agent:
         self.steering.start()
 
         last_input_tokens = 0
-        for i in range(self.start_round + 1, MAX_ROUNDS + 1):
+        for i in range(self.start_round + 1, self.max_rounds + 1):
             if self._sigint:
                 print("[中断] 已在安全点优雅停止。")
                 break
 
             self._drain_steering()
+            self._scripted_steer(i)
             self._maybe_compact(last_input_tokens)
 
             approx = ctx.estimate_tokens(self.messages)
             print(f"\n{'#'*60}\n# ROUND {i:02d}  messages={len(self.messages)}  approx_tokens≈{approx}\n{'#'*60}")
 
+            def _on_retry(a, d, e):
+                self.metrics["retries"] += 1
+                print(f"  [retry] 第 {a} 次重试，{d:.1f}s 后（{type(e).__name__}）")
+
             try:
                 resp = recovery.with_retry(
                     lambda: self.provider.chat(self.messages, TOOLS),
                     enabled=self.retry_on,
-                    on_attempt=lambda a, d, e: print(f"  [retry] 第 {a} 次重试，{d:.1f}s 后（{type(e).__name__}）"),
+                    on_attempt=_on_retry,
                 )
             except recovery.ContextOverflow:
                 print("  [overflow] 上下文超窗，紧急压缩后重试本轮")
@@ -132,22 +158,34 @@ class Agent:
                 continue
 
             last_input_tokens = resp.usage.input
+            self.metrics["input_tokens"].append(resp.usage.input)
+            self.metrics["rounds"] = i
             self.messages.append(resp.assistant_msg)
             self.log.append("message", {"message": resp.assistant_msg})
             self.log.append("round", {"n": i})
             print(f"[usage] input={resp.usage.input} output={resp.usage.output}")
 
             if not resp.tool_calls:
+                self.metrics["completed"] = True
                 print(f"\n[FINAL]\n{resp.text}")
                 break
 
             self._run_tools(resp.tool_calls)
+
+            if self._crash_after and i >= self._crash_after:
+                # 模拟进程被 kill -9：不走任何清理，直接消失。
+                # JSONL 已逐行 flush+fsync，所以状态留在磁盘，resume 可恢复。
+                self.metrics["crashed"] = True
+                print(f"  [chaos] 模拟崩溃：第 {i} 轮后进程被强杀")
+                import os
+                os._exit(137)
         else:
-            print(f"\n[到达 MAX_ROUNDS={MAX_ROUNDS}，强制停止]")
+            print(f"\n[到达 MAX_ROUNDS={self.max_rounds}，强制停止]")
 
         self.steering.stop()
         self.log.close()
         print(f"\n[会话 {self.session_id} 结束] resume: python agent.py --resume {self.session_id}")
+        return self.metrics
 
     def _run_tools(self, tool_calls):
         for tc in tool_calls:
@@ -169,6 +207,8 @@ class Agent:
             except Exception as e:  # noqa: BLE001
                 raw = f"[工具错误] {type(e).__name__}: {e}"
                 ok = False
+            if not ok:
+                self.metrics["tool_fails"] += 1
             result = ctx.offload_tool_result(raw, tc.name)
             self._tool_result(tc.id, result, ok=ok)
             # 连续失败熔断
@@ -195,10 +235,9 @@ class Agent:
     def _maybe_compact(self, last_input_tokens):
         if not self.compact_on:
             return
-        window = self.provider.context_window
         approx = ctx.estimate_tokens(self.messages)
         signal_tokens = max(last_input_tokens, approx)
-        if signal_tokens >= window * ctx.TRIGGER_RATIO:
+        if signal_tokens >= self.context_window * ctx.TRIGGER_RATIO:
             self._force_compact()
 
     def _force_compact(self):
@@ -207,6 +246,7 @@ class Agent:
         if new_msgs is None:
             return
         self.messages = new_msgs
+        self.metrics["compactions"] += 1
         self.log.append("compaction", {"messages": new_msgs})
         after = ctx.estimate_tokens(self.messages)
         print(f"  [compact] 历史压缩 {before}→{after} tokens（约 -{before-after}）")
@@ -221,13 +261,28 @@ def main():
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--no-retry", action="store_true")
     p.add_argument("--no-interrupt", action="store_true")
+    # 评测钩子（给 evals/ 用；日常使用不必关心）
+    p.add_argument("--max-rounds", type=int, default=MAX_ROUNDS)
+    p.add_argument("--context-window", type=int, default=None)
+    p.add_argument("--crash-after", type=int, default=None)
+    p.add_argument("--steer-json", default=None, help='JSON {"轮号": "插话"}')
+    p.add_argument("--chaos-json", default=None, help="JSON 故障注入配置")
+    p.add_argument("--metrics-out", default=None, help="把 metrics 落盘到此路径")
     args = p.parse_args()
+    if args.steer_json:
+        args.steer_at = {int(k): v for k, v in json.loads(args.steer_json).items()}
+    if args.chaos_json:
+        args.chaos = json.loads(args.chaos_json)
 
     if not args.task and not args.resume:
         p.error("需要任务描述，或用 --resume <id> 续跑")
 
     load_env()
-    Agent(args).run()
+    agent = Agent(args)
+    metrics = agent.run()
+    if getattr(args, "metrics_out", None) and metrics is not None:
+        from pathlib import Path
+        Path(args.metrics_out).write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

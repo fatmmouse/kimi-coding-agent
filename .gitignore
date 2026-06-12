@@ -1,6 +1,9 @@
 # 密钥永不入库
 .env
 
+# macOS
+.DS_Store
+
 # Python
 __pycache__/
 *.pyc
@@ -10,3 +13,4 @@ __pycache__/
 .agent/
 workspace/
 evals/results/raw/
+evals/results/*.log
