@@ -19,6 +19,7 @@ import argparse
 import json
 import signal
 import sys
+import time
 
 from harness import context as ctx
 from harness import interrupt as interrupt_mod
@@ -63,6 +64,13 @@ class Agent:
         self.metrics = {
             "completed": False, "rounds": 0, "input_tokens": [],
             "compactions": 0, "retries": 0, "tool_fails": 0, "crashed": False,
+            # ---- 时间维度（题眼是「2 小时」，时间是第一指标）----
+            "wall_total": 0.0,      # 总墙钟耗时（秒）
+            "per_round_wall": [],   # 每轮耗时
+            "api_time": 0.0,        # 纯 LLM 调用耗时（不含重试等待）
+            "tool_time": 0.0,       # 工具执行耗时
+            "compact_time": 0.0,    # 上下文压缩耗时（这是 overhead）
+            "retry_wait": 0.0,      # 重试退避等待累计
         }
 
     # ---------- 会话装载：新建或 resume ----------
@@ -129,10 +137,12 @@ class Agent:
         self.steering.start()
 
         last_input_tokens = 0
+        wall_start = time.monotonic()
         for i in range(self.start_round + 1, self.max_rounds + 1):
             if self._sigint:
                 print("[中断] 已在安全点优雅停止。")
                 break
+            round_t0 = time.monotonic()
 
             self._drain_steering()
             self._scripted_steer(i)
@@ -143,8 +153,10 @@ class Agent:
 
             def _on_retry(a, d, e):
                 self.metrics["retries"] += 1
+                self.metrics["retry_wait"] += d
                 print(f"  [retry] 第 {a} 次重试，{d:.1f}s 后（{type(e).__name__}）")
 
+            api_t0 = time.monotonic()
             try:
                 resp = recovery.with_retry(
                     lambda: self.provider.chat(self.messages, TOOLS),
@@ -156,6 +168,8 @@ class Agent:
                 if self.compact_on:
                     self._force_compact()
                 continue
+            # 纯 API 时间 = 整段耗时 - 本轮退避等待
+            self.metrics["api_time"] += (time.monotonic() - api_t0)
 
             last_input_tokens = resp.usage.input
             self.metrics["input_tokens"].append(resp.usage.input)
@@ -167,10 +181,15 @@ class Agent:
 
             if not resp.tool_calls:
                 self.metrics["completed"] = True
+                self.metrics["per_round_wall"].append(round(time.monotonic() - round_t0, 2))
                 print(f"\n[FINAL]\n{resp.text}")
                 break
 
+            tool_t0 = time.monotonic()
             self._run_tools(resp.tool_calls)
+            self.metrics["tool_time"] += (time.monotonic() - tool_t0)
+
+            self.metrics["per_round_wall"].append(round(time.monotonic() - round_t0, 2))
 
             if self._crash_after and i >= self._crash_after:
                 # 模拟进程被 kill -9：不走任何清理，直接消失。
@@ -182,10 +201,35 @@ class Agent:
         else:
             print(f"\n[到达 MAX_ROUNDS={self.max_rounds}，强制停止]")
 
+        # retry_wait 算在 api_time 里了，扣出来归到独立桶
+        self.metrics["api_time"] = round(self.metrics["api_time"] - self.metrics["retry_wait"], 2)
+        self.metrics["retry_wait"] = round(self.metrics["retry_wait"], 2)
+        self.metrics["tool_time"] = round(self.metrics["tool_time"], 2)
+        self.metrics["compact_time"] = round(self.metrics["compact_time"], 2)
+        self.metrics["wall_total"] = round(time.monotonic() - wall_start, 2)
+
         self.steering.stop()
         self.log.close()
+        self._print_time_profile()
         print(f"\n[会话 {self.session_id} 结束] resume: python agent.py --resume {self.session_id}")
         return self.metrics
+
+    def _print_time_profile(self):
+        """时间画像 + 2 小时外推——直接回应题目的「连续执行 2 小时」。"""
+        m = self.metrics
+        wall = m["wall_total"] or 1e-9
+        rounds = m["rounds"] or 1
+        per_round = wall / rounds
+        proj_2h = int(7200 / per_round) if per_round > 0 else 0
+        def pct(x):
+            return f"{x:6.1f}s ({100*x/wall:4.1f}%)"
+        print(f"\n{'='*60}\n[时间画像]  总耗时 {wall:.1f}s / {rounds} 轮  (avg {per_round:.1f}s/轮)")
+        print(f"  纯 LLM 调用 : {pct(m['api_time'])}")
+        print(f"  工具执行    : {pct(m['tool_time'])}")
+        print(f"  上下文压缩  : {pct(m['compact_time'])}   <- overhead")
+        print(f"  重试等待    : {pct(m['retry_wait'])}")
+        print(f"  按此速率，连续跑 2 小时 ≈ 可执行 {proj_2h} 轮")
+        print(f"{'='*60}")
 
     def _run_tools(self, tool_calls):
         for tc in tool_calls:
@@ -242,14 +286,16 @@ class Agent:
 
     def _force_compact(self):
         before = ctx.estimate_tokens(self.messages)
+        t0 = time.monotonic()
         new_msgs, usage = ctx.compact(self.messages, self.provider)
         if new_msgs is None:
             return
+        self.metrics["compact_time"] += (time.monotonic() - t0)
         self.messages = new_msgs
         self.metrics["compactions"] += 1
         self.log.append("compaction", {"messages": new_msgs})
         after = ctx.estimate_tokens(self.messages)
-        print(f"  [compact] 历史压缩 {before}→{after} tokens（约 -{before-after}）")
+        print(f"  [compact] 历史压缩 {before}→{after} tokens（约 -{before-after}），耗时 {time.monotonic()-t0:.1f}s")
 
 
 def main():

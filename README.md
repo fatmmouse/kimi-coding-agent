@@ -21,16 +21,18 @@ Kimi For Coding（Anthropic 协议）与 DeepSeek（OpenAI 协议），对上层
 ## 运行
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install openai anthropic
+python3 -m venv .venv && .venv/bin/pip install openai anthropic pytest
 
 # 写 .env（不进 git）：
-#   KIMI_API_KEY=sk-...
+#   KIMI_API_KEY=sk-...      # Kimi For Coding（K2.7），走 Anthropic 协议
 #   DEEPSEEK_API_KEY=sk-...
 
-.venv/bin/python agent.py "在 workspace 写一个 fizzbuzz.py 并运行"
+.venv/bin/python agent.py "在 workspace 写一个 fizzbuzz.py 并运行"   # 默认 K2.7
 .venv/bin/python agent.py --model deepseek "..."     # 换 provider
 .venv/bin/python agent.py --resume 20260612-160038   # 崩溃后续跑
 ```
+
+每轮结束打印**时间画像**（LLM/工具/压缩/重试各阶段耗时 + 按此速率 2 小时可执行多少轮）——题眼是「2 小时」，时间是第一指标。
 
 机制开关（用于 ablation）：`--no-compact` `--no-resume` `--no-retry` `--no-interrupt`
 
@@ -43,12 +45,13 @@ python3 -m venv .venv && .venv/bin/pip install openai anthropic
 
 场景 × ablation 矩阵（[evals/scenarios.py](evals/scenarios.py)），故障注入见 [evals/chaos.py](evals/chaos.py)：
 
-| 场景 | 验证什么 | 对照 |
-|---|---|---|
-| S1 | 长任务里上下文是否被压制 | compact on/off |
-| S2 | API 故障下能否跑完 | retry on/off |
-| S3 | kill-9 后能否从断点续跑 | resume vs 从头 |
-| S4 | 工具失败能否自纠 | 单组（看 tool_fails>0 且 completed） |
-| S5 | 运行中改需求能否采纳 | steer on/off |
+| 场景 | 验证什么 | 对照 | 任务 |
+|---|---|---|---|
+| S1 | 长任务里上下文是否被压制 | compact on/off | 表达式求值器 + pytest（硬） |
+| S2 | API 故障下能否跑完 | retry on/off | fizzbuzz + 故障注入 |
+| S3 | kill-9 后能否从断点续跑 | resume vs 从头 | 多步任务 + 真 os._exit |
+| S4 | 工具失败能否自纠 | 单组（tool_fails>0 且 completed） | 埋必失败命令 |
+| S5 | 运行中改需求能否采纳 | steer on/off | 中途注入改需求 |
+| **S6** | **四机制协同扛真实长任务 + 时间画像** | 全机制开（压轴） | **完整 KV store：TTL+持久化+恢复+pytest（最硬）** |
 
-结果落在 [evals/results/](evals/results/)。
+结果落在 [evals/results/](evals/results/)。完整设计与数据解读见 [docs/answer.md](docs/answer.md)。

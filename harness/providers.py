@@ -126,10 +126,10 @@ class DeepSeekProvider(Provider):
         )
 
 
-# ---------- Kimi For Coding：Anthropic 协议，需要双向翻译 ----------
+# ---------- Kimi For Coding（K2.7 Code）：Anthropic 协议，需要双向翻译 ----------
 class KimiProvider(Provider):
     name = "kimi"
-    context_window = 262_144
+    context_window = 262_144  # model id 固定 kimi-for-coding，后台已自动升级到 K2.7
 
     def __init__(self, model: str = "kimi-for-coding", max_tokens: int = 8192):
         import anthropic
@@ -237,7 +237,7 @@ class KimiProvider(Provider):
 
 def make_provider(name: str) -> Provider:
     name = name.lower()
-    if name in ("kimi", "k2", "k2.6"):
+    if name in ("kimi", "k2", "k2.6", "k2.7"):
         return KimiProvider()
     if name in ("deepseek", "ds"):
         return DeepSeekProvider()
