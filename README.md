@@ -53,5 +53,13 @@ python3 -m venv .venv && .venv/bin/pip install openai anthropic pytest
 | S4 | 工具失败能否自纠 | 单组（tool_fails>0 且 completed） | 埋必失败命令 |
 | S5 | 运行中改需求能否采纳 | steer on/off | 中途注入改需求 |
 | **S6** | **四机制协同扛真实长任务 + 时间画像** | 全机制开（压轴） | **完整 KV store：TTL+持久化+恢复+pytest（最硬）** |
+| **S7** | **真实代码库长程压力 + 评测驱动修 bug** | 全机制 + resume | **给 boltons 逐模块补测试：252 轮 / 361 测试全绿** |
 
-结果落在 [evals/results/](evals/results/)。完整设计与数据解读见 [docs/answer.md](docs/answer.md)。
+结果落在 [evals/results/](evals/results/)（S7 产物证据在 [s7_artifacts/](evals/results/s7_artifacts/)）。完整设计与数据解读见 [docs/answer.md](docs/answer.md)。
+
+S7 长程复现（约 20 分钟，需先把 boltons 放进 workspace/）：
+```bash
+git clone --depth 1 https://github.com/mahmoud/boltons /tmp/b && cp -r /tmp/b/boltons workspace/boltons
+PATH="$PWD/.venv/bin:$PATH" .venv/bin/python agent.py --max-rounds 300 --context-window 64000 \
+  "为 workspace/boltons/ 的纯函数模块逐个写 pytest 测试放 tests/，每写完跑 python -m pytest 确认通过，先写 todo.md 逐项打勾"
+```

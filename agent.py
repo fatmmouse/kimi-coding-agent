@@ -29,6 +29,9 @@ from harness.state import SessionLog, new_session_id
 from harness.tools import TOOL_FUNCS, TOOLS
 
 MAX_ROUNDS = 80
+# 无工具调用但 todo.md 仍有未完成项时，最多 nudge 续跑几次。
+# 防「模型发了句过渡性的话却没调工具」被误判为任务完成（长程任务里真实发生过），也防无限空转。
+MAX_CONTINUE_NUDGES = 5
 
 SYSTEM_PROMPT = (
     "You are a coding agent working ONLY inside ./workspace. "
@@ -39,7 +42,10 @@ SYSTEM_PROMPT = (
     "3. After completing and VERIFYING each item (run it, inspect output), edit_file todo.md "
     "to check it off `- [x]`.\n"
     "4. VERIFY before finishing with run_command (run the code, list files, print outputs).\n"
-    "DONE means every item is done AND verified. Then reply with a short final message and call NO tool."
+    "DONE means every `- [ ]` in todo.md is checked off `- [x]` AND verified. "
+    "While ANY `- [ ]` remains, you are NOT done—every turn must call a tool to make progress on the next item; "
+    "do NOT stop with a plain message like 'next I will do X'. "
+    "Only when everything is done AND verified, reply with a short final message and call NO tool."
 )
 
 
@@ -52,6 +58,7 @@ class Agent:
         self.guard = recovery.LoopGuard()
         self.steering = interrupt_mod.StdinSteering(enabled=not args.no_interrupt)
         self._sigint = 0
+        self._continue_nudges = 0  # 完成判定 nudge 计数（见主循环 no-tool 分支）
         # ---- 评测钩子（CLI 不暴露，评测脚本经 SimpleNamespace 注入）----
         self.max_rounds = getattr(args, "max_rounds", MAX_ROUNDS)
         self.context_window = getattr(args, "context_window", None) or self.provider.context_window
@@ -130,6 +137,14 @@ class Agent:
         self.log.append("message", {"message": msg})
         print(f"[steering] 已注入: {line}")
 
+    def _todo_has_open_items(self) -> bool:
+        """todo.md 里是否还有未打勾的 `- [ ]`——完成判定的 ground truth。"""
+        from harness.tools import WORKSPACE
+        todo = WORKSPACE / "todo.md"
+        if not todo.exists():
+            return False
+        return "- [ ]" in todo.read_text(encoding="utf-8", errors="ignore")
+
     # ---------- 主循环 ----------
     def run(self):
         self.load()
@@ -180,11 +195,25 @@ class Agent:
             print(f"[usage] input={resp.usage.input} output={resp.usage.output}")
 
             if not resp.tool_calls:
+                # 完成判定：没调工具 ≠ 任务真完成。模型可能只是发了句过渡性的话
+                # （「接下来我去做 X」）。用 todo.md 这个语义状态层做 ground truth——
+                # 还有未打勾项就 nudge 续跑，连续 nudge 到上限仍不动手才真正收尾（防空转）。
+                if self._todo_has_open_items() and self._continue_nudges < MAX_CONTINUE_NUDGES:
+                    self._continue_nudges += 1
+                    nudge = {"role": "user", "content":
+                             "[继续] todo.md 里还有未打勾的项没做完。请直接调用工具继续处理下一个未完成项，"
+                             "不要只回复一句话。某项确实做不了就在 todo.md 注明原因再跳过。"}
+                    self.messages.append(nudge)
+                    self.log.append("message", {"message": nudge})
+                    self.metrics["per_round_wall"].append(round(time.monotonic() - round_t0, 2))
+                    print(f"  [continue] todo 仍有未完成项，nudge 续跑（{self._continue_nudges}/{MAX_CONTINUE_NUDGES}）")
+                    continue
                 self.metrics["completed"] = True
                 self.metrics["per_round_wall"].append(round(time.monotonic() - round_t0, 2))
                 print(f"\n[FINAL]\n{resp.text}")
                 break
 
+            self._continue_nudges = 0  # 模型又动手了，恢复 nudge 预算
             tool_t0 = time.monotonic()
             self._run_tools(resp.tool_calls)
             self.metrics["tool_time"] += (time.monotonic() - tool_t0)
